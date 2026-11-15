@@ -3,9 +3,9 @@
 A tool that reads a slow Postgres query's execution plan, asks an LLM what is
 wrong with it, and proves the suggested fix by re-timing the query.
 
-This repository is at step one: a Postgres database with eight million rows and
-three queries that are genuinely slow, each for a different reason. The tool
-itself comes next.
+This repository has two parts: a Postgres database with eight million rows and
+three queries that are genuinely slow, each for a different reason, and
+`triage.py`, the tool that diagnoses them.
 
 ## Why
 
@@ -46,7 +46,8 @@ docker compose exec -T db psql -U postgres -d shop \
 ```
 
 `sql/99_fixes.sql` applies the fixes and `sql/00_reset.sql` puts the database
-back into its slow state. `bench.py` does both for you.
+back into its slow state (it also drops any index `triage.py` created).
+`bench.py` does both for you.
 
 ## The three queries
 
@@ -104,10 +105,70 @@ finding three rows means scanning six million.
 
 Fix: `CREATE INDEX ON order_items (order_id)`.
 
+## triage.py
+
+```bash
+export ANTHROPIC_API_KEY=...
+PSQL="docker compose exec -T db psql -U postgres -d shop" \
+  python triage.py --query-file sql/03_slow_queries.sql --number 1 --apply
+```
+
+It runs `EXPLAIN (ANALYZE, BUFFERS)` on the query, collects the columns,
+indexes and row counts of the tables involved, and sends all of it to the model,
+which answers with a diagnosis and one of three fixes: an index, a rewritten
+query, or nothing. Without `--apply` it only prints the diagnosis.
+
+With `--apply` it proves the fix rather than trusting it:
+
+1. Only plain `CREATE INDEX name ON table (columns)` statements run. Anything
+   else, a second statement, a comment, an expression or partial index, a table
+   that is not in the query, is refused before any statement executes.
+2. The query is timed again (median of five `EXPLAIN ANALYZE` runs) and its
+   output is compared with the original, ignoring row order.
+3. The fix is kept only if the results are identical and the query is at least
+   1.25x faster. Otherwise the index is dropped again and it says why.
+
+A rewrite, like the one Q2 needs, is timed and compared the same way, and
+nothing is changed in the database.
+
+Run against the seeded database with the three fixes above supplied as saved
+model answers, it keeps all three, with identical results:
+
+```
+Diagnosis: Both customers and orders are read with parallel sequential scans: ...
+before 132.89 ms, after 0.20 ms (664.4x), same results: True
+KEPT: index kept
+```
+
+and it undoes an index that does not help (`CREATE INDEX ON customers (country)`
+for Q1 came out 1.05x faster and was dropped again).
+
+Other options: `--prompt-only` prints exactly what would be sent, with no API
+call, and `--response FILE` replays a saved answer. The model comes from
+`TRIAGE_MODEL`.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+28 tests, no database and no API key: a fake `psql` and a fake model cover the
+answer parsing, the statement allow-list and the keep-or-undo decision. They are
+what runs in GitHub Actions. The end-to-end runs above were done by hand against
+Postgres 16.
+
+## Limitations
+
+The live API call has not been run in this repository's tests, and the three
+results above used saved answers rather than a model's own. Whether a model
+diagnoses every plan correctly is the thing still to be measured. The tool also
+only knows about indexes and query rewrites, and only on one query at a time.
+
 ## Next
 
-1. `triage.py`: connect, run `EXPLAIN (ANALYZE, BUFFERS)`, collect the schema
-   and row counts for the tables involved, send all of it to an LLM, print the
-   diagnosis.
-2. `--apply`: create the suggested index, re-run, print both timings.
-3. Tests and a GitHub Actions workflow.
+1. Run it against the live API on all three queries and record the model's own
+   diagnoses next to the fixes in `sql/99_fixes.sql`.
+2. An integration job in Actions with a Postgres service.
+3. More slow-query shapes: sorts without an index, `OR` conditions, `LIKE '%x'`.
